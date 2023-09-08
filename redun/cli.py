@@ -1378,6 +1378,18 @@ class RedunClient:
         )
         server_parser.set_defaults(func=self.server_command)
 
+        # PgExecutor worker spawner
+        pg_executor_parser = subparsers.add_parser(
+            "pg-executor-worker",
+            help="Start worker process for the given executor of type 'pg'.",
+        )
+        pg_executor_parser.add_argument(
+            "name",
+            help="Name or alias of the excutor",
+            default="default",
+        )
+        pg_executor_parser.set_defaults(func=self.pg_executor_command)
+
         return parser
 
     def help_command(self, args: Namespace, extra_args: List[str], argv: List[str]) -> None:
@@ -1807,7 +1819,7 @@ class RedunClient:
         """
         Display an Execution.
         """
-        status = execution.status
+        status = execution.status_display
 
         self.display(
             "Exec {id} [{status}] {start_time}:  {args} {tags}".format(
@@ -1912,7 +1924,7 @@ class RedunClient:
         self.display(
             "Job {id} [{status}] {start_time}:  {task_name}({args}) {tags}".format(
                 id=format_id(job.id, detail),
-                status=job.status.center(self.STATUS_WIDTH),
+                status=job.status_display.center(self.STATUS_WIDTH),
                 start_time=job.start_time.strftime("%Y-%m-%d %H:%M:%S"),
                 task_name=job.task.fullname,
                 args=args,
@@ -3096,3 +3108,9 @@ class RedunClient:
             env={k: str(v) for (k, v) in compose_env.items() if v is not None},
             shell=True,
         )
+
+    def pg_executor_command(self, args: Namespace, extra_args: List[str], argv: List[str]) -> None:
+        from redun import PgExecutor
+
+        config: Config = setup_config(args.config)
+        PgExecutor.run_worker(config["executors"][args.name])

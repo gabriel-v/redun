@@ -14,13 +14,18 @@ from textual.containers import Container, Vertical
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import Screen
-from textual.widgets import Footer, Input, Label, Static, TextLog
+from textual.widgets import Footer, Input, Label, RichLog, Static
 
 from redun import File
 from redun.backends.db import Argument, CallNode, Execution
 from redun.backends.db import File as DbFile
 from redun.backends.db import Job, Subvalue, Tag, Task, Value
-from redun.backends.db.query import CallGraphQuery, parse_callgraph_query, setup_query_parser
+from redun.backends.db.query import (
+    REDUN_ERROR_TYPE_NAME,
+    CallGraphQuery,
+    parse_callgraph_query,
+    setup_query_parser,
+)
 from redun.cli import format_timedelta
 from redun.console.parser import format_args, parse_args
 from redun.console.utils import format_record, format_tags, format_traceback, style_status
@@ -37,7 +42,6 @@ from redun.console.widgets import (
     ValueSpan,
 )
 from redun.scheduler import ErrorValue
-from redun.scheduler import Job as SchedulerJob
 from redun.task import split_task_fullname
 from redun.utils import trim_string
 
@@ -197,7 +201,7 @@ class ReplScreen(RedunScreen):
     def __init__(self, locals={}, obj_id: Optional[str] = None):
         self.obj_id = obj_id
         super().__init__()
-        self.text_log = TextLog()
+        self.text_log = RichLog()
         self.input = CommandInput(placeholder="Execute Python code...")
 
         def query(expr: Any, *args: Any, **kwargs: Any) -> Any:
@@ -362,7 +366,7 @@ class SearchScreen(RedunScreen):
     results = reactive(None)
     page = reactive(1)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
 
         self.page_size = DEFAULT_PAGE_SIZE
@@ -370,6 +374,8 @@ class SearchScreen(RedunScreen):
         self.input = CommandInput("", complete=False, placeholder="Enter search...")
         self.results_table = Table(id="search-results")
         self.results_table.add_columns("Search results")
+
+        self.search_query: Optional[CallGraphQuery] = None
 
     def get_path(self) -> str:
         return "search"
@@ -392,6 +398,16 @@ class SearchScreen(RedunScreen):
         if self.page > 1:
             self.page -= 1
             self.query_one(RedunFooter).page = self.page
+
+    def action_repl(self) -> None:
+        screen = self.app.get_screen("ReplScreen")
+        screen.update(
+            {
+                "results": self.results,
+                "search_query": self.search_query,
+            }
+        )
+        self.app.push_screen(screen)
 
     def watch_page(self) -> None:
         self.call_after_refresh(self.load_results)
@@ -429,7 +445,6 @@ class SearchScreen(RedunScreen):
         self.app.goto_record(record)
 
     async def load_results(self) -> None:
-
         if format_args(self.parser, self.args) == []:
             self.results = []
             return
@@ -447,6 +462,7 @@ class SearchScreen(RedunScreen):
                 .joinedload(Argument.value),
             )
         )
+        self.search_query = query
 
         self.results = list(query.page(self.page - 1, self.page_size))
 
@@ -1123,7 +1139,7 @@ class JobScreen(RedunScreen):
             self.header,
             Container(
                 Static(
-                    f"[bold]Job[/] {self.job.id} {style_status(self.job.status)} "
+                    f"[bold]Job[/] {self.job.id} {style_status(self.job.status_display)} "
                     f"{start_time} [bold]{self.job.task.fullname}[/]"
                 ),
                 Static(format_traceback(self.job)),
@@ -1221,7 +1237,7 @@ class ExecutionScreen(RedunScreen):
             "--status",
             default=[],
             action="append",
-            help="Filter jobs by status (DONE, FAILED, CACHED).",
+            help="Filter jobs by status (RUNNING, FAILED, CACHED, DONE).",
         )
         parser.add_argument(
             "--task", default=[], action="append", help="Filter jobs by task name."
@@ -1302,6 +1318,23 @@ class ExecutionScreen(RedunScreen):
             return
 
         page = self.args.page
+        result_type_joined = False
+
+        def join_result_type(query):
+            nonlocal result_type_joined
+            if result_type_joined:
+                return query
+            result_type_joined = True
+            # Here we join Value.type in order to help compute Job status. We are careful to not
+            # join all the field Value fields, since Value.value tends to be quite large
+            # and expensive to load into memory.
+            # We must also use outerjoins since CallNode might not exist for some Jobs
+            # (Job running or killed).
+            return (
+                query.add_columns(Value.type)
+                .outerjoin(CallNode, Job.call_hash == CallNode.call_hash)
+                .outerjoin(Value, CallNode.value_hash == Value.value_hash)
+            )
 
         if not self.args.job:
             # Show job tree.
@@ -1309,6 +1342,7 @@ class ExecutionScreen(RedunScreen):
 
             query = self.app.session.query(Job).filter(Job.execution_id == self.execution_id)
 
+            # Filter by task name.
             for task_fullname in self.args.task:
                 show_tree = False
                 namespace, name = split_task_fullname(task_fullname)
@@ -1316,20 +1350,29 @@ class ExecutionScreen(RedunScreen):
                     Task.namespace == namespace, Task.name == name
                 )
 
+            # Filter by Job status.
+            if self.args.status:
+                query = join_result_type(query)
             for status in self.args.status:
                 show_tree = False
-                if status == "FAILED":
+                if status == "RUNNING":
                     query = query.filter(Job.end_time.is_(None))
                 elif status == "CACHED":
                     query = query.filter(Job.cached.is_(True))
+                elif status == "FAILED":
+                    query = query.filter(Value.type == REDUN_ERROR_TYPE_NAME)
                 elif status == "DONE":
-                    query = query.filter(Job.end_time.isnot(None) & Job.cached.is_(False))
+                    query = query.filter(
+                        Job.cached.is_(False) & (Value.type != REDUN_ERROR_TYPE_NAME)
+                    )
 
             if show_tree:
                 # Figure out sorting and depth in job tree.
                 all_jobs = tree_sort_jobs(self.execution.job, self.execution.jobs)
             else:
-                all_jobs = list(query.all())
+                all_jobs = list(query.order_by(Job.start_time).all())
+                if result_type_joined:
+                    all_jobs = [job for job, _ in all_jobs]
 
                 # Assign default depth.
                 for job in all_jobs:
@@ -1343,26 +1386,39 @@ class ExecutionScreen(RedunScreen):
             ]
 
             # Fetch page worth of jobs from db.
-            self.jobs = sorted(
-                query.filter(Job.id.in_(page_job_ids))
+            job_result_types = sorted(
+                join_result_type(query)
+                .filter(Job.id.in_(page_job_ids))
                 .options(
                     joinedload(Job.task),
                     joinedload(Job.call_node)
                     .joinedload(CallNode.arguments)
                     .joinedload(Argument.value),
                 )
-                .order_by(Job.start_time)
                 .all(),
-                key=lambda x: job2index[x.id],
+                key=lambda job_result_type: job2index[job_result_type[0].id],
             )
+
+            self.jobs = []
+            for job, result_type in job_result_types:
+                job.calc_status(result_type)
+                self.jobs.append(job)
 
         else:
             # Show immediate child jobs.
             root_id = self.args.job
 
             root = self.app.session.query(Job).filter(Job.id == root_id).all()
-            children = (
-                self.app.session.query(Job)
+
+            # Here we join Value.type in order to help compute Job status. We are careful to not
+            # join all the field Value fields, since Value.value tends to be quite large
+            # and expensive to load into memory.
+            # We must also use outerjoins since CallNode might not exist for some Jobs
+            # (Job running or killed).
+            children_result_types = (
+                self.app.session.query(Job, Value.type)
+                .outerjoin(CallNode, Job.call_hash == CallNode.call_hash)
+                .outerjoin(Value, CallNode.call_hash == Value.value_hash)
                 .filter(Job.parent_id == root_id)
                 .options(
                     joinedload(Job.task),
@@ -1375,6 +1431,10 @@ class ExecutionScreen(RedunScreen):
                 .limit(self.page_size)
                 .all()
             )
+            children = []
+            for job, result_type in children_result_types:
+                job.calc_status(result_type)
+                children.append(job)
 
             self.jobs = root + children
             if root:
@@ -1398,7 +1458,7 @@ class ExecutionScreen(RedunScreen):
 
             else:
                 # A status is selected.
-                status = SchedulerJob.STATUSES[coord.column - 1]
+                status = JobStatusTable.JOB_STATUSES[coord.column - 1]
                 if status == "TOTAL":
                     self.args.status = []
                 else:
@@ -1425,13 +1485,14 @@ class ExecutionScreen(RedunScreen):
 
         self.job_list.focus()
 
+        exec_status = self.execution.status_display
         start_time = self.execution.job.start_time.strftime("%Y-%m-%d %H:%M:%S")
         args = " ".join(json.loads(self.execution.args)[1:])
 
         yield Container(
             self.header,
             Static(
-                f"[bold]Execution[/] {self.execution.id} {style_status(self.execution.status)} "
+                f"[bold]Execution[/] {self.execution.id} {style_status(exec_status)} "
                 f"{start_time}: {args}",
                 id="execution-title",
             ),
@@ -1669,7 +1730,8 @@ class ExecutionsScreen(RedunScreen):
         """
         Load executions list from db.
         """
-        query = self.app.session.query(Execution)
+        # Bulk fetch Executions and result types.
+        query = self.app.session.query(Execution, Value.type)
 
         if self.args.id:
             query = query.filter(Execution.id.like(self.args.id + "%"))
@@ -1683,17 +1745,27 @@ class ExecutionsScreen(RedunScreen):
                 | Execution.args.like("%" + self.args.find + "%")
             )
 
-        self.execution_list.executions = (
+        results = (
             query.options(
                 joinedload(Execution.job).joinedload(Job.task),
             )
             .join(Job, Execution.job_id == Job.id)
+            .outerjoin(CallNode, Job.call_hash == CallNode.call_hash)
+            .outerjoin(Value, CallNode.value_hash == Value.value_hash)
             .join(Task, Job.task_hash == Task.hash)
             .order_by(Job.start_time.desc())
             .offset((self.args.page - 1) * self.page_size)
             .limit(self.page_size)
             .all()
         )
+
+        # Calculate Execution statuses using the bulk query.
+        executions = []
+        for execution, result_type in results:
+            execution.calc_status(result_type)
+            executions.append(execution)
+
+        self.execution_list.executions = executions
 
     def compose(self) -> ComposeResult:
         self.execution_list.focus()
